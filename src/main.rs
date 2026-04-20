@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 
 const HEADER_LEN: usize = 12;
@@ -120,6 +122,69 @@ async fn stats_task(stats: Arc<Stats>) {
     }
 }
 
+async fn recv_loop(
+    host: String,
+    port: u16,
+    pkt_len: usize,
+    stats: Arc<Stats>,
+    sample_tx: mpsc::UnboundedSender<Vec<i16>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let server_addr = format!("{}:{}", host, port);
+    socket.connect(&server_addr).await?;
+    println!("Connected to {}", server_addr);
+    socket.send(b"register").await?;
+
+    let mut buf = vec![0u8; pkt_len];
+    let mut reg_interval = time::interval(Duration::from_secs(2));
+    reg_interval.tick().await;
+
+    let mut last_pkt_id: Option<i32> = None;
+    let mut last_warn = std::time::Instant::now() - Duration::from_secs(10);
+
+    loop {
+        tokio::select! {
+            result = socket.recv(&mut buf) => {
+                match result {
+                    Ok(n) if n == pkt_len => {
+                        let pkt_id = i32::from_le_bytes(buf[8..12].try_into().unwrap());
+
+                        if let Some(last) = last_pkt_id {
+                            let diff = pkt_id.wrapping_sub(last);
+                            if diff == 1 {
+                                // normal
+                            } else if diff > 1 && diff < 1000 {
+                                stats.lost.fetch_add((diff - 1) as u64, Ordering::Relaxed);
+                            } else {
+                                continue;
+                            }
+                        }
+                        last_pkt_id = Some(pkt_id);
+
+                        stats.received.fetch_add(1, Ordering::Relaxed);
+                        stats.latest_pkt_id.store(pkt_id, Ordering::Relaxed);
+
+                        let payload = &buf[HEADER_LEN..n];
+                        let samples: Vec<i16> = payload
+                            .chunks_exact(2)
+                            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                            .collect();
+                        let _ = sample_tx.send(samples);
+                    }
+                    Ok(n) => {
+                        if last_warn.elapsed() > Duration::from_secs(1) {
+                            eprintln!("unexpected packet size {} (expected {})", n, pkt_len);
+                            last_warn = std::time::Instant::now();
+                        }
+                    }
+                    Err(e) => eprintln!("UDP recv error: {}", e),
+                }
+            }
+            _ = reg_interval.tick() => { let _ = socket.send(b"register").await; }
+        }
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let cli = Cli::parse();
@@ -128,11 +193,27 @@ async fn main() {
         Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
     };
     println!("Config: {:?}", cfg);
+    println!("Expected packet size: {} bytes", cfg.pkt_len);
 
     let stats = Arc::new(Stats::default());
     let stats_handle = tokio::spawn(stats_task(stats.clone()));
 
+    let (sample_tx, sample_rx) = mpsc::unbounded_channel::<Vec<i16>>();
+
+    let recv_handle = {
+        let stats = stats.clone();
+        let host = cfg.host.clone();
+        tokio::spawn(async move {
+            if let Err(e) = recv_loop(host, cfg.port, cfg.pkt_len, stats, sample_tx).await {
+                eprintln!("recv_loop error: {}", e);
+            }
+        })
+    };
+
+    let _ = sample_rx;
+
     tokio::signal::ctrl_c().await.ok();
     stats_handle.abort();
+    recv_handle.abort();
     println!("Shutdown");
 }
