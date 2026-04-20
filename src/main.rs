@@ -1,4 +1,8 @@
 use clap::Parser;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{BufferSize, SampleRate, StreamConfig};
+use ringbuf::traits::{Consumer, Producer, Split};
+use ringbuf::{HeapCons, HeapRb};
 use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
@@ -185,6 +189,34 @@ async fn recv_loop(
     }
 }
 
+fn start_playback(
+    sample_rate: u32,
+    n_channel: u16,
+    mut consumer: HeapCons<i16>,
+) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
+    let host = cpal::default_host();
+    let device = host.default_output_device().ok_or("no default output device")?;
+    println!("Playback device: {}", device.name().unwrap_or_default());
+
+    let config = StreamConfig {
+        channels: n_channel,
+        sample_rate: SampleRate(sample_rate),
+        buffer_size: BufferSize::Default,
+    };
+
+    let stream = device.build_output_stream(
+        &config,
+        move |data: &mut [i16], _| {
+            let read = consumer.pop_slice(data);
+            for s in &mut data[read..] { *s = 0; }
+        },
+        move |err| eprintln!("Playback error: {}", err),
+        None,
+    )?;
+    stream.play()?;
+    Ok(stream)
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let cli = Cli::parse();
@@ -198,7 +230,11 @@ async fn main() {
     let stats = Arc::new(Stats::default());
     let stats_handle = tokio::spawn(stats_task(stats.clone()));
 
-    let (sample_tx, sample_rx) = mpsc::unbounded_channel::<Vec<i16>>();
+    let (sample_tx, mut sample_rx) = mpsc::unbounded_channel::<Vec<i16>>();
+
+    let ring_capacity = 32 * cfg.sample_per_packet * cfg.n_channel as usize;
+    let rb = HeapRb::<i16>::new(ring_capacity);
+    let (mut producer, consumer) = rb.split();
 
     let recv_handle = {
         let stats = stats.clone();
@@ -210,10 +246,20 @@ async fn main() {
         })
     };
 
-    let _ = sample_rx;
+    let writer_handle = tokio::spawn(async move {
+        while let Some(samples) = sample_rx.recv().await {
+            producer.push_slice(&samples);
+        }
+    });
+
+    let _stream = match start_playback(cfg.sample_rate, cfg.n_channel, consumer) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("Failed to start playback: {}", e); std::process::exit(1); }
+    };
 
     tokio::signal::ctrl_c().await.ok();
     stats_handle.abort();
     recv_handle.abort();
+    writer_handle.abort();
     println!("Shutdown");
 }
