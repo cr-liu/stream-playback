@@ -46,6 +46,14 @@ struct Cli {
 
 #[derive(Deserialize, Debug, Default)]
 struct FileConfig {
+    #[serde(default)]
+    receiver: ReceiverSection,
+    #[serde(default)]
+    gui: GuiSection,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct ReceiverSection {
     host: Option<String>,
     port: Option<u16>,
     sample_rate: Option<u32>,
@@ -53,6 +61,14 @@ struct FileConfig {
     sample_per_packet: Option<usize>,
     pkt_len: Option<usize>,
     listen_port: Option<u16>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct GuiSection {
+    enabled: Option<bool>,
+    bind_addr: Option<String>,
+    port: Option<u16>,
+    password: Option<String>,
 }
 
 #[derive(Debug)]
@@ -63,6 +79,10 @@ struct Config {
     sample_per_packet: usize,
     pkt_len: usize,
     listen_port: Option<u16>,
+    gui_enabled: bool,
+    gui_bind_addr: String,
+    gui_port: u16,
+    gui_password: String,
 }
 
 impl Config {
@@ -76,18 +96,28 @@ impl Config {
             }
             None => FileConfig::default(),
         };
-        let host = cli.host.or(file.host)
+
+        let host = cli.host.or(file.receiver.host)
             .ok_or_else(|| "--host is required (or set in config)".to_string())?;
-        let port = cli.port.or(file.port).unwrap_or(7998);
-        let sample_rate = cli.sample_rate.or(file.sample_rate).unwrap_or(16000);
+        let port = cli.port.or(file.receiver.port).unwrap_or(7998);
+        let sample_rate = cli.sample_rate.or(file.receiver.sample_rate).unwrap_or(16000);
         // n_channel is only used to compute the default pkt_len — it represents
         // the sender's total channel count, not the playback channel count.
-        let n_channel = cli.n_channel.or(file.n_channel).unwrap_or(1);
-        let sample_per_packet = cli.sample_per_packet.or(file.sample_per_packet).unwrap_or(32);
-        let pkt_len = cli.pkt_len.or(file.pkt_len)
+        let n_channel = cli.n_channel.or(file.receiver.n_channel).unwrap_or(1);
+        let sample_per_packet = cli.sample_per_packet.or(file.receiver.sample_per_packet).unwrap_or(32);
+        let pkt_len = cli.pkt_len.or(file.receiver.pkt_len)
             .unwrap_or(HEADER_LEN + n_channel as usize * sample_per_packet * 2);
-        let listen_port = cli.listen_port.or(file.listen_port);
-        Ok(Config { host, port, sample_rate, sample_per_packet, pkt_len, listen_port })
+        let listen_port = cli.listen_port.or(file.receiver.listen_port);
+
+        let gui_enabled = file.gui.enabled.unwrap_or(true);
+        let gui_bind_addr = file.gui.bind_addr.unwrap_or_else(|| "0.0.0.0".to_string());
+        let gui_port = file.gui.port.unwrap_or(8081);
+        let gui_password = file.gui.password.unwrap_or_else(|| "test".to_string());
+
+        Ok(Config {
+            host, port, sample_rate, sample_per_packet, pkt_len, listen_port,
+            gui_enabled, gui_bind_addr, gui_port, gui_password,
+        })
     }
 }
 
