@@ -1,6 +1,6 @@
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{BufferSize, SampleRate, StreamConfig};
+use cpal::SampleFormat;
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::{HeapCons, HeapRb};
 use serde::Deserialize;
@@ -216,30 +216,95 @@ async fn recv_loop(
     }
 }
 
+/// Start cpal playback.
+///
+/// Adapts to the device's default output config: queries sample rate,
+/// channel count, and sample format, and converts the incoming mono
+/// i16 stream on the fly.
+///
+/// Resampling is nearest-neighbor (fine for a test tool; not hi-fi).
+/// Mono → N channels is done by duplicating the sample to every channel.
 fn start_playback(
-    sample_rate: u32,
-    n_channel: u16,
+    stream_rate: u32,
     mut consumer: HeapCons<i16>,
 ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
     let host = cpal::default_host();
     let device = host.default_output_device().ok_or("no default output device")?;
     println!("Playback device: {}", device.name().unwrap_or_default());
 
-    let config = StreamConfig {
-        channels: n_channel,
-        sample_rate: SampleRate(sample_rate),
-        buffer_size: BufferSize::Default,
+    let supported = device.default_output_config()?;
+    let sample_format = supported.sample_format();
+    let output_rate = supported.sample_rate().0;
+    let output_channels = supported.channels();
+    let config = supported.config();
+
+    println!(
+        "Device output: {} Hz, {} ch, {:?}; stream source: {} Hz mono",
+        output_rate, output_channels, sample_format, stream_rate,
+    );
+
+    // Nearest-neighbor resample: for every output frame, advance a
+    // fractional source index by (stream_rate / output_rate).
+    // When the accumulator crosses 1.0, pop one source sample.
+    let step = stream_rate as f64 / output_rate as f64;
+    let channels = output_channels as usize;
+
+    let err_fn = |err| eprintln!("Playback stream error: {}", err);
+
+    let stream = match sample_format {
+        SampleFormat::I16 => {
+            let mut src_pos = 1.0_f64; // force first pop on first frame
+            let mut current: i16 = 0;
+            device.build_output_stream(
+                &config,
+                move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                    let frames = data.len() / channels;
+                    for f in 0..frames {
+                        while src_pos >= 1.0 {
+                            src_pos -= 1.0;
+                            let mut buf = [0i16; 1];
+                            current = if consumer.pop_slice(&mut buf) == 1 { buf[0] } else { 0 };
+                        }
+                        for c in 0..channels {
+                            data[f * channels + c] = current;
+                        }
+                        src_pos += step;
+                    }
+                },
+                err_fn,
+                None,
+            )?
+        }
+        SampleFormat::F32 => {
+            let mut src_pos = 1.0_f64;
+            let mut current: f32 = 0.0;
+            device.build_output_stream(
+                &config,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    let frames = data.len() / channels;
+                    for f in 0..frames {
+                        while src_pos >= 1.0 {
+                            src_pos -= 1.0;
+                            let mut buf = [0i16; 1];
+                            current = if consumer.pop_slice(&mut buf) == 1 {
+                                buf[0] as f32 / 32768.0
+                            } else {
+                                0.0
+                            };
+                        }
+                        for c in 0..channels {
+                            data[f * channels + c] = current;
+                        }
+                        src_pos += step;
+                    }
+                },
+                err_fn,
+                None,
+            )?
+        }
+        other => return Err(format!("unsupported sample format: {:?}", other).into()),
     };
 
-    let stream = device.build_output_stream(
-        &config,
-        move |data: &mut [i16], _| {
-            let read = consumer.pop_slice(data);
-            for s in &mut data[read..] { *s = 0; }
-        },
-        move |err| eprintln!("Playback error: {}", err),
-        None,
-    )?;
     stream.play()?;
     Ok(stream)
 }
@@ -283,7 +348,7 @@ async fn main() {
     });
 
     // Always play mono (ch0 only).
-    let _stream = match start_playback(cfg.sample_rate, 1, consumer) {
+    let _stream = match start_playback(cfg.sample_rate, consumer) {
         Ok(s) => s,
         Err(e) => { eprintln!("Failed to start playback: {}", e); std::process::exit(1); }
     };
