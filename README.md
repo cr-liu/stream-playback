@@ -53,10 +53,17 @@ Use this when the server has your address in its `static_receivers` list:
 ### Config file
 
 ```toml
+[receiver]
 host = "192.168.1.10"
 port = 7998
 n_channel = 1
 listen_port = 7999   # optional
+
+[gui]
+enabled = true
+bind_addr = "0.0.0.0"
+port = 8081
+password = "test"
 ```
 
 CLI args override config values.
@@ -70,3 +77,16 @@ Stats print every second:
 ```
 
 Ctrl+C to stop.
+
+## Web GUI
+
+On startup the binary serves a web GUI at `http://<bind_addr>:<port>` (default `http://0.0.0.0:8081`). Log in with the password from `[gui] password` (default: `test`).
+
+Features:
+- Edit `config.toml` in the browser (all fields require restart)
+- Live waveform of the incoming audio stream (channel 0)
+- Red vertical **playhead line** showing current ring-buffer water level — the distance from the right edge is proportional to playback latency
+- Stats panel (packets received, lost, current packet_id, ring occupancy)
+- Restart button
+
+Set `[gui] enabled = false` to disable, or `bind_addr = "127.0.0.1"` to restrict to localhost.
