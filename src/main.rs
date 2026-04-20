@@ -89,6 +89,8 @@ struct Config {
 
 impl Config {
     fn resolve(cli: Cli) -> Result<Config, String> {
+        // Explicit --config takes priority; otherwise fall back to ./config.toml
+        // if it exists, so Windows/GUI users can just double-click the binary.
         let file = match cli.config.as_ref() {
             Some(path) => {
                 let text = fs::read_to_string(path)
@@ -96,7 +98,17 @@ impl Config {
                 toml::from_str::<FileConfig>(&text)
                     .map_err(|e| format!("failed to parse config: {}", e))?
             }
-            None => FileConfig::default(),
+            None => {
+                let default_path = std::path::Path::new("config.toml");
+                if default_path.exists() {
+                    let text = fs::read_to_string(default_path)
+                        .map_err(|e| format!("failed to read ./config.toml: {}", e))?;
+                    toml::from_str::<FileConfig>(&text)
+                        .map_err(|e| format!("failed to parse ./config.toml: {}", e))?
+                } else {
+                    FileConfig::default()
+                }
+            }
         };
 
         let host = cli.host.or(file.receiver.host)

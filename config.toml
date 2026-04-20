@@ -1,0 +1,20 @@
+[receiver]
+# Server host (mic2sock sender IP). "none" is treated as unconfigured.
+host = "192.168.1.10"
+# Server port — matches mic2sock's [sender] listen_port.
+port = 7998
+sample_rate = 16000
+# Sender's total channel count. Only ch0 is played; used to compute pkt_len.
+n_channel = 16
+sample_per_packet = 32
+# Override packet size in bytes (else computed from n_channel * sample_per_packet * 2 + 12).
+# pkt_len = 1036
+# Bind local UDP port to this value; when set, suppresses sending "register".
+# Pair this with the sender's [sender] static_receivers entry.
+# listen_port = 7999
+
+[gui]
+enabled = true
+bind_addr = "0.0.0.0"
+port = 8081
+password = "test"
