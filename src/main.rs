@@ -13,6 +13,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 
+mod gui;
+
 const HEADER_LEN: usize = 12;
 
 #[derive(Parser, Debug)]
@@ -378,11 +380,6 @@ async fn main() {
     let samples_produced_for_gui = samples_produced.clone();
     let samples_produced_for_writer = samples_produced.clone();
 
-    // Suppress unused warnings until GUI task wires these in.
-    let _ = wave_tap_for_gui;
-    let _ = playback_pos_for_gui;
-    let _ = samples_produced_for_gui;
-
     // Ring buffer sized for mono (ch0) only — 32 packets of jitter headroom.
     let ring_capacity = 32 * cfg.sample_per_packet;
     let rb = HeapRb::<i16>::new(ring_capacity);
@@ -415,9 +412,39 @@ async fn main() {
         Err(e) => { eprintln!("Failed to start playback: {}", e); std::process::exit(1); }
     };
 
+    // Compute ring capacity (same formula as in ring buffer creation above)
+    let ring_capacity_samples = 32 * cfg.sample_per_packet;
+
+    let gui_handle = if cfg.gui_enabled {
+        let handles = Arc::new(gui::GuiHandles {
+            waveform_tap: wave_tap_for_gui.clone(),
+            playback_pos: playback_pos_for_gui.clone(),
+            samples_produced: samples_produced_for_gui.clone(),
+            ring_capacity_samples,
+            stats: stats.clone(),
+            config_path: std::path::PathBuf::from("config.toml"),
+        });
+        let gui_cfg = gui::GuiConfig {
+            enabled: cfg.gui_enabled,
+            bind_addr: cfg.gui_bind_addr.clone(),
+            port: cfg.gui_port,
+            password: cfg.gui_password.clone(),
+        };
+        Some(tokio::spawn(async move {
+            if let Err(e) = gui::start_gui(gui_cfg, handles).await {
+                eprintln!("GUI error: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
+
     tokio::signal::ctrl_c().await.ok();
     stats_handle.abort();
     recv_handle.abort();
     writer_handle.abort();
+    if let Some(h) = gui_handle {
+        h.abort();
+    }
     println!("Shutdown");
 }
