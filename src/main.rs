@@ -2,6 +2,7 @@ use clap::Parser;
 use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 const HEADER_LEN: usize = 12;
 
@@ -71,6 +72,23 @@ impl Config {
         let pkt_len = cli.pkt_len.or(file.pkt_len)
             .unwrap_or(HEADER_LEN + n_channel as usize * sample_per_packet * 2);
         Ok(Config { host, port, sample_rate, n_channel, sample_per_packet, pkt_len })
+    }
+}
+
+#[derive(Default)]
+struct Stats {
+    received: AtomicU64,
+    lost: AtomicU64,
+    latest_pkt_id: AtomicI32,
+}
+
+impl Stats {
+    fn snapshot(&self) -> (u64, u64, i32) {
+        (
+            self.received.load(Ordering::Relaxed),
+            self.lost.load(Ordering::Relaxed),
+            self.latest_pkt_id.load(Ordering::Relaxed),
+        )
     }
 }
 
