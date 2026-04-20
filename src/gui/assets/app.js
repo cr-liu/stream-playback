@@ -1,16 +1,17 @@
 const configDiv = document.getElementById('config');
+const statsDiv = document.getElementById('stats');
 const saveBtn = document.getElementById('save');
 const reloadBtn = document.getElementById('reload');
 const restartBtn = document.getElementById('restart');
 
 let currentConfig = null;
+let ringCapacity = 1;
+let latestOccupied = 0;
 
 async function loadConfig() {
   const res = await fetch('/api/config');
   if (!res.ok) { configDiv.textContent = 'Failed to load config'; return; }
   currentConfig = await res.json();
-  // The server includes _meta; strip for rendering
-  const meta = currentConfig._meta;
   delete currentConfig._meta;
   renderConfig(currentConfig);
 }
@@ -33,7 +34,6 @@ function renderConfig(cfg) {
           renderFields(sub, item, [section, idx]);
           fs.appendChild(sub);
         } else {
-          // shouldn't happen at top level but handle gracefully
           renderField(fs, String(idx), item, [section, idx]);
         }
       });
@@ -68,16 +68,9 @@ function renderField(parent, key, val, path) {
   const label = document.createElement('label');
   label.textContent = key + ': ';
   const input = document.createElement('input');
-  if (typeof val === 'boolean') {
-    input.type = 'checkbox';
-    input.checked = val;
-  } else if (typeof val === 'number') {
-    input.type = 'number';
-    input.value = val;
-  } else {
-    input.type = 'text';
-    input.value = val;
-  }
+  if (typeof val === 'boolean') { input.type = 'checkbox'; input.checked = val; }
+  else if (typeof val === 'number') { input.type = 'number'; input.value = val; }
+  else { input.type = 'text'; input.value = val; }
   input.dataset.path = JSON.stringify(path);
   input.dataset.type = typeof val;
   row.appendChild(label);
@@ -150,7 +143,6 @@ saveBtn.onclick = async () => {
 };
 
 reloadBtn.onclick = () => loadConfig();
-
 restartBtn.onclick = async () => {
   if (!confirm('Restart the binary?')) return;
   await fetch('/api/restart', { method: 'POST' });
@@ -158,6 +150,20 @@ restartBtn.onclick = async () => {
 };
 
 loadConfig();
+
+// ── Stats polling ──
+async function refreshStats() {
+  try {
+    const res = await fetch('/api/stats');
+    if (!res.ok) return;
+    const s = await res.json();
+    ringCapacity = s.ring_capacity || 1;
+    statsDiv.textContent =
+      `recv=${s.received} lost=${s.lost} pkt_id=${s.pkt_id} ring=${s.ring_occupied}/${s.ring_capacity}`;
+  } catch (_) {}
+}
+setInterval(refreshStats, 1000);
+refreshStats();
 
 // ── Waveform canvas ──
 const canvas = document.getElementById('waveform');
@@ -176,10 +182,12 @@ function connectWaveformWS() {
 
   ws.onmessage = (ev) => {
     const view = new DataView(ev.data);
-    const sampleCount = (ev.data.byteLength - 4) / 2;
+    // Receiver frame: [4 B ts][8 B ring_occupied][2N samples]
+    latestOccupied = Number(view.getBigUint64(4, true));
+    const sampleCount = (ev.data.byteLength - 12) / 2;
     pointBuf.copyWithin(0, sampleCount);
     for (let i = 0; i < sampleCount; i++) {
-      pointBuf[BUF_LEN - sampleCount + i] = view.getInt16(4 + i * 2, true);
+      pointBuf[BUF_LEN - sampleCount + i] = view.getInt16(12 + i * 2, true);
     }
   };
 
@@ -191,6 +199,7 @@ function drawWaveform() {
   const w = canvas.width;
   const h = canvas.height;
   ctx.clearRect(0, 0, w, h);
+
   ctx.strokeStyle = '#2a9';
   ctx.beginPath();
   const step = w / BUF_LEN;
@@ -200,6 +209,16 @@ function drawWaveform() {
     if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
   }
   ctx.stroke();
+
+  // Playhead: distance from right edge proportional to ring_occupied/ring_capacity.
+  const ratio = Math.min(latestOccupied / ringCapacity, 1.0);
+  const playheadX = w - ratio * w;
+  ctx.strokeStyle = '#e33';
+  ctx.beginPath();
+  ctx.moveTo(playheadX, 0);
+  ctx.lineTo(playheadX, h);
+  ctx.stroke();
+
   requestAnimationFrame(drawWaveform);
 }
 
