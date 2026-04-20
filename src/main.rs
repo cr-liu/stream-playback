@@ -39,6 +39,9 @@ struct Cli {
     /// Override packet size in bytes (else computed)
     #[arg(long)]
     pkt_len: Option<usize>,
+    /// Bind local UDP port to this value (else ephemeral); when set, suppresses register
+    #[arg(long)]
+    listen_port: Option<u16>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -49,6 +52,7 @@ struct FileConfig {
     n_channel: Option<u16>,
     sample_per_packet: Option<usize>,
     pkt_len: Option<usize>,
+    listen_port: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -58,6 +62,7 @@ struct Config {
     sample_rate: u32,
     sample_per_packet: usize,
     pkt_len: usize,
+    listen_port: Option<u16>,
 }
 
 impl Config {
@@ -81,7 +86,8 @@ impl Config {
         let sample_per_packet = cli.sample_per_packet.or(file.sample_per_packet).unwrap_or(32);
         let pkt_len = cli.pkt_len.or(file.pkt_len)
             .unwrap_or(HEADER_LEN + n_channel as usize * sample_per_packet * 2);
-        Ok(Config { host, port, sample_rate, sample_per_packet, pkt_len })
+        let listen_port = cli.listen_port.or(file.listen_port);
+        Ok(Config { host, port, sample_rate, sample_per_packet, pkt_len, listen_port })
     }
 }
 
@@ -132,14 +138,24 @@ async fn recv_loop(
     port: u16,
     pkt_len: usize,
     sample_per_packet: usize,
+    listen_port: Option<u16>,
     stats: Arc<Stats>,
     sample_tx: mpsc::UnboundedSender<Vec<i16>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let bind_addr = match listen_port {
+        Some(p) => format!("0.0.0.0:{}", p),
+        None => "0.0.0.0:0".to_string(),
+    };
+    let socket = UdpSocket::bind(&bind_addr).await?;
     let server_addr = format!("{}:{}", host, port);
     socket.connect(&server_addr).await?;
-    println!("Connected to {}", server_addr);
-    socket.send(b"register").await?;
+    println!("Connected to {} (local bind {})", server_addr, bind_addr);
+
+    // Only send register when the server doesn't know our address.
+    let use_register = listen_port.is_none();
+    if use_register {
+        socket.send(b"register").await?;
+    }
 
     let mut buf = vec![0u8; pkt_len];
     let mut reg_interval = time::interval(Duration::from_secs(2));
@@ -191,7 +207,11 @@ async fn recv_loop(
                     Err(e) => eprintln!("UDP recv error: {}", e),
                 }
             }
-            _ = reg_interval.tick() => { let _ = socket.send(b"register").await; }
+            _ = reg_interval.tick() => {
+                if use_register {
+                    let _ = socket.send(b"register").await;
+                }
+            }
         }
     }
 }
@@ -248,8 +268,9 @@ async fn main() {
         let stats = stats.clone();
         let host = cfg.host.clone();
         let spp = cfg.sample_per_packet;
+        let lp = cfg.listen_port;
         tokio::spawn(async move {
-            if let Err(e) = recv_loop(host, cfg.port, cfg.pkt_len, spp, stats, sample_tx).await {
+            if let Err(e) = recv_loop(host, cfg.port, cfg.pkt_len, spp, lp, stats, sample_tx).await {
                 eprintln!("recv_loop error: {}", e);
             }
         })
