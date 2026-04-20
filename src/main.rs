@@ -2,7 +2,10 @@ use clap::Parser;
 use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::time::{self, Duration};
 
 const HEADER_LEN: usize = 12;
 
@@ -92,11 +95,44 @@ impl Stats {
     }
 }
 
-fn main() {
+async fn stats_task(stats: Arc<Stats>) {
+    let mut interval = time::interval(Duration::from_secs(1));
+    interval.tick().await;
+    let mut last_received: u64 = 0;
+    let mut last_lost: u64 = 0;
+    loop {
+        interval.tick().await;
+        let (received, lost, pkt_id) = stats.snapshot();
+        let delta_recv = received.saturating_sub(last_received);
+        let delta_lost = lost.saturating_sub(last_lost);
+        last_received = received;
+        last_lost = lost;
+
+        let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let hh = (secs / 3600) % 24;
+        let mm = (secs / 60) % 60;
+        let ss = secs % 60;
+
+        println!(
+            "[{:02}:{:02}:{:02}] recv/s={:<5} lost/s={:<5} total_recv={:<8} total_lost={:<6} pkt_id={}",
+            hh, mm, ss, delta_recv, delta_lost, received, lost, pkt_id,
+        );
+    }
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     let cli = Cli::parse();
     let cfg = match Config::resolve(cli) {
         Ok(c) => c,
         Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
     };
     println!("Config: {:?}", cfg);
+
+    let stats = Arc::new(Stats::default());
+    let stats_handle = tokio::spawn(stats_task(stats.clone()));
+
+    tokio::signal::ctrl_c().await.ok();
+    stats_handle.abort();
+    println!("Shutdown");
 }
