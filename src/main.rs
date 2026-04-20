@@ -171,6 +171,7 @@ async fn recv_loop(
     listen_port: Option<u16>,
     stats: Arc<Stats>,
     sample_tx: mpsc::UnboundedSender<Vec<i16>>,
+    waveform_tap: tokio::sync::broadcast::Sender<Vec<i16>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bind_addr = match listen_port {
         Some(p) => format!("0.0.0.0:{}", p),
@@ -225,6 +226,7 @@ async fn recv_loop(
                                 .chunks_exact(2)
                                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                                 .collect();
+                            let _ = waveform_tap.send(samples.clone());
                             let _ = sample_tx.send(samples);
                         }
                     }
@@ -257,6 +259,7 @@ async fn recv_loop(
 fn start_playback(
     stream_rate: u32,
     mut consumer: HeapCons<i16>,
+    playback_pos: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
     let host = cpal::default_host();
     let device = host.default_output_device().ok_or("no default output device")?;
@@ -285,21 +288,26 @@ fn start_playback(
         SampleFormat::I16 => {
             let mut src_pos = 1.0_f64; // force first pop on first frame
             let mut current: i16 = 0;
+            let playback_pos_cap = playback_pos.clone();
             device.build_output_stream(
                 &config,
                 move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
                     let frames = data.len() / channels;
+                    let mut played_this_call: u64 = 0;
                     for f in 0..frames {
                         while src_pos >= 1.0 {
                             src_pos -= 1.0;
                             let mut buf = [0i16; 1];
-                            current = if consumer.pop_slice(&mut buf) == 1 { buf[0] } else { 0 };
+                            let got = consumer.pop_slice(&mut buf);
+                            played_this_call += got as u64;
+                            current = if got == 1 { buf[0] } else { 0 };
                         }
                         for c in 0..channels {
                             data[f * channels + c] = current;
                         }
                         src_pos += step;
                     }
+                    playback_pos_cap.fetch_add(played_this_call, std::sync::atomic::Ordering::Relaxed);
                 },
                 err_fn,
                 None,
@@ -308,15 +316,19 @@ fn start_playback(
         SampleFormat::F32 => {
             let mut src_pos = 1.0_f64;
             let mut current: f32 = 0.0;
+            let playback_pos_cap = playback_pos.clone();
             device.build_output_stream(
                 &config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let frames = data.len() / channels;
+                    let mut played_this_call: u64 = 0;
                     for f in 0..frames {
                         while src_pos >= 1.0 {
                             src_pos -= 1.0;
                             let mut buf = [0i16; 1];
-                            current = if consumer.pop_slice(&mut buf) == 1 {
+                            let got = consumer.pop_slice(&mut buf);
+                            played_this_call += got as u64;
+                            current = if got == 1 {
                                 buf[0] as f32 / 32768.0
                             } else {
                                 0.0
@@ -327,6 +339,7 @@ fn start_playback(
                         }
                         src_pos += step;
                     }
+                    playback_pos_cap.fetch_add(played_this_call, std::sync::atomic::Ordering::Relaxed);
                 },
                 err_fn,
                 None,
@@ -354,6 +367,22 @@ async fn main() {
 
     let (sample_tx, mut sample_rx) = mpsc::unbounded_channel::<Vec<i16>>();
 
+    let (wave_tap_tx, _) = tokio::sync::broadcast::channel::<Vec<i16>>(4);
+    let wave_tap_for_gui = wave_tap_tx.clone();
+
+    let playback_pos = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let playback_pos_for_gui = playback_pos.clone();
+    let playback_pos_for_cpal = playback_pos.clone();
+
+    let samples_produced = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let samples_produced_for_gui = samples_produced.clone();
+    let samples_produced_for_writer = samples_produced.clone();
+
+    // Suppress unused warnings until GUI task wires these in.
+    let _ = wave_tap_for_gui;
+    let _ = playback_pos_for_gui;
+    let _ = samples_produced_for_gui;
+
     // Ring buffer sized for mono (ch0) only — 32 packets of jitter headroom.
     let ring_capacity = 32 * cfg.sample_per_packet;
     let rb = HeapRb::<i16>::new(ring_capacity);
@@ -364,8 +393,9 @@ async fn main() {
         let host = cfg.host.clone();
         let spp = cfg.sample_per_packet;
         let lp = cfg.listen_port;
+        let wt = wave_tap_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = recv_loop(host, cfg.port, cfg.pkt_len, spp, lp, stats, sample_tx).await {
+            if let Err(e) = recv_loop(host, cfg.port, cfg.pkt_len, spp, lp, stats, sample_tx, wt).await {
                 eprintln!("recv_loop error: {}", e);
             }
         })
@@ -373,12 +403,14 @@ async fn main() {
 
     let writer_handle = tokio::spawn(async move {
         while let Some(samples) = sample_rx.recv().await {
+            let n = samples.len();
             producer.push_slice(&samples);
+            samples_produced_for_writer.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         }
     });
 
     // Always play mono (ch0 only).
-    let _stream = match start_playback(cfg.sample_rate, consumer) {
+    let _stream = match start_playback(cfg.sample_rate, consumer, playback_pos_for_cpal) {
         Ok(s) => s,
         Err(e) => { eprintln!("Failed to start playback: {}", e); std::process::exit(1); }
     };
