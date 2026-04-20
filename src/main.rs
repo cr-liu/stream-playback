@@ -56,7 +56,6 @@ struct Config {
     host: String,
     port: u16,
     sample_rate: u32,
-    n_channel: u16,
     sample_per_packet: usize,
     pkt_len: usize,
 }
@@ -76,11 +75,13 @@ impl Config {
             .ok_or_else(|| "--host is required (or set in config)".to_string())?;
         let port = cli.port.or(file.port).unwrap_or(7998);
         let sample_rate = cli.sample_rate.or(file.sample_rate).unwrap_or(16000);
+        // n_channel is only used to compute the default pkt_len — it represents
+        // the sender's total channel count, not the playback channel count.
         let n_channel = cli.n_channel.or(file.n_channel).unwrap_or(1);
         let sample_per_packet = cli.sample_per_packet.or(file.sample_per_packet).unwrap_or(32);
         let pkt_len = cli.pkt_len.or(file.pkt_len)
             .unwrap_or(HEADER_LEN + n_channel as usize * sample_per_packet * 2);
-        Ok(Config { host, port, sample_rate, n_channel, sample_per_packet, pkt_len })
+        Ok(Config { host, port, sample_rate, sample_per_packet, pkt_len })
     }
 }
 
@@ -130,6 +131,7 @@ async fn recv_loop(
     host: String,
     port: u16,
     pkt_len: usize,
+    sample_per_packet: usize,
     stats: Arc<Stats>,
     sample_tx: mpsc::UnboundedSender<Vec<i16>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -168,12 +170,17 @@ async fn recv_loop(
                         stats.received.fetch_add(1, Ordering::Relaxed);
                         stats.latest_pkt_id.store(pkt_id, Ordering::Relaxed);
 
-                        let payload = &buf[HEADER_LEN..n];
-                        let samples: Vec<i16> = payload
-                            .chunks_exact(2)
-                            .map(|c| i16::from_le_bytes([c[0], c[1]]))
-                            .collect();
-                        let _ = sample_tx.send(samples);
+                        // Channel-major format: ch0 is the first block after the header.
+                        // Extract only ch0 samples and discard the rest.
+                        let ch0_end = HEADER_LEN + sample_per_packet * 2;
+                        if n >= ch0_end {
+                            let ch0_bytes = &buf[HEADER_LEN..ch0_end];
+                            let samples: Vec<i16> = ch0_bytes
+                                .chunks_exact(2)
+                                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                                .collect();
+                            let _ = sample_tx.send(samples);
+                        }
                     }
                     Ok(n) => {
                         if last_warn.elapsed() > Duration::from_secs(1) {
@@ -232,15 +239,17 @@ async fn main() {
 
     let (sample_tx, mut sample_rx) = mpsc::unbounded_channel::<Vec<i16>>();
 
-    let ring_capacity = 32 * cfg.sample_per_packet * cfg.n_channel as usize;
+    // Ring buffer sized for mono (ch0) only — 32 packets of jitter headroom.
+    let ring_capacity = 32 * cfg.sample_per_packet;
     let rb = HeapRb::<i16>::new(ring_capacity);
     let (mut producer, consumer) = rb.split();
 
     let recv_handle = {
         let stats = stats.clone();
         let host = cfg.host.clone();
+        let spp = cfg.sample_per_packet;
         tokio::spawn(async move {
-            if let Err(e) = recv_loop(host, cfg.port, cfg.pkt_len, stats, sample_tx).await {
+            if let Err(e) = recv_loop(host, cfg.port, cfg.pkt_len, spp, stats, sample_tx).await {
                 eprintln!("recv_loop error: {}", e);
             }
         })
@@ -252,7 +261,8 @@ async fn main() {
         }
     });
 
-    let _stream = match start_playback(cfg.sample_rate, cfg.n_channel, consumer) {
+    // Always play mono (ch0 only).
+    let _stream = match start_playback(cfg.sample_rate, 1, consumer) {
         Ok(s) => s,
         Err(e) => { eprintln!("Failed to start playback: {}", e); std::process::exit(1); }
     };
